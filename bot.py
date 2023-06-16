@@ -10,9 +10,8 @@ from contextlib import closing
 
 TELEGRAM_TOKEN = "*****"
 UNSPLASH_ACCESS_KEY = "******"
-DEEPL_API_KEY = "*******"
+DEEPL_API_KEY = "******"
 LINGUA_ROBOT_API_KEY = "******"
-VOICE_KEY = "*******"
 DATABASE = 'words.db'
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -23,6 +22,54 @@ cursor = conn.cursor()
 
 cursor.execute('''CREATE TABLE IF NOT EXISTS words
                   (chat_id text, word text, definition text, image_url text, translated_word text, transcription text)''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS skipped_words
+                  (chat_id text, word text)''')
+
+
+def get_random_word():
+    word = None
+    definition = None
+    transcription = None
+    audio_url = None
+    while word is None or definition is None or transcription is None or audio_url is None:
+        try:
+            url = "https://api.datamuse.com/words?ml=love"
+            response = requests.get(url).json()
+            random_word = random.choice(response)
+            word = random_word['word']
+
+            cursor.execute("SELECT * FROM words WHERE word=?", (word,))
+            if cursor.fetchone() is not None:
+                word = None
+                definition = None
+                transcription = None
+                continue
+
+            cursor.execute("SELECT * FROM skipped_words WHERE word=?", (word,))
+            if cursor.fetchone() is not None:
+                word = None
+                definition = None
+                transcription = None
+                continue
+
+            url = f"https://lingua-robot.p.rapidapi.com/language/v1/entries/en/{word}"
+            headers = {
+                "X-RapidAPI-Key": LINGUA_ROBOT_API_KEY,
+                "X-RapidAPI-Host": "lingua-robot.p.rapidapi.com"
+            }
+            response = requests.get(url, headers=headers).json()
+            definition = response['entries'][0]['lexemes'][0]['senses'][0]['definition']
+            transcription = response['entries'][0]['pronunciations'][0]['transcriptions'][0]['transcription']
+            audio_url = response['entries'][0]['pronunciations'][1]['audio']['url']
+            transcription = transcription.replace('/', '')
+
+        except (KeyError, IndexError):
+            word = None
+            definition = None
+            transcription = None
+            audio_url = None
+    return word, definition, transcription, audio_url
 
 
 def translate_word(word):
@@ -38,41 +85,6 @@ def translate_word(word):
     response_json = json.loads(response.text)
     translated_text = response_json["translations"][0]["text"]
     return translated_text
-
-
-def get_random_word():
-    word = None
-    definition = None
-    transcription = None
-    while word is None or definition is None or transcription is None:
-        try:
-            url = "https://api.datamuse.com/words?ml=love"
-            response = requests.get(url).json()
-            random_word = random.choice(response)
-            word = random_word['word']
-
-            cursor.execute("SELECT * FROM words WHERE word=?", (word,))
-            if cursor.fetchone() is not None:
-                word = None
-                definition = None
-                transcription = None
-                continue
-
-            url = f"https://lingua-robot.p.rapidapi.com/language/v1/entries/en/{word}"
-            headers = {
-                "X-RapidAPI-Key": LINGUA_ROBOT_API_KEY,
-                "X-RapidAPI-Host": "lingua-robot.p.rapidapi.com"
-            }
-            response = requests.get(url, headers=headers).json()
-            definition = response['entries'][0]['lexemes'][0]['senses'][0]['definition']
-            transcription = response['entries'][0]['pronunciations'][0]['transcriptions'][0]['transcription']
-            transcription = transcription.replace('/', '')
-
-        except (KeyError, IndexError):
-            word = None
-            definition = None
-            transcription = None
-    return word, definition, transcription
 
 
 def get_image(word):
@@ -105,16 +117,15 @@ def handle_messages(update: Update, context: CallbackContext) -> None:
 def learn(update: Update, context: CallbackContext) -> None:
     chat_id = update.message.chat_id
     loading_message = context.bot.send_message(chat_id=chat_id, text="Wait for the words...")
-    word, definition, transcription = get_random_word()
+    word, definition, transcription, audio_url = get_random_word()
     image_url = get_image(word)
     translated_word = translate_word(word)
     context.chat_data['word_data'] = (chat_id, word, definition, image_url, translated_word, transcription)
 
-    url = f"http://api.voicerss.org/?key={VOICE_KEY}&hl=en-us&v=Linda&src={word}&r=-2"
-    response = requests.request("GET", url)
-
     valid_filename = "".join(c for c in word if c.isalpha() or c.isspace()).rstrip()
 
+    # Fetch audio file from audio_url and save it locally
+    response = requests.get(audio_url)
     with open(f'{valid_filename}.mp3', 'wb') as audio_file:
         audio_file.write(response.content)
 
@@ -137,53 +148,6 @@ def learn(update: Update, context: CallbackContext) -> None:
     context.chat_data['last_audio'] = audio_message.message_id
 
     os.remove(f"{valid_filename}.mp3")
-
-
-def clear(update: Update, context: CallbackContext) -> None:
-    query = update
-    chat_id = query.message.chat_id
-    cursor.execute("DELETE FROM words WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    context.bot.send_message(chat_id=chat_id, text="All learned words are deleted.")
-    start(query, context)
-
-
-def button(update: Update, context: CallbackContext) -> None:
-    query = update.callback_query
-    query.answer()
-
-    # Delete the previous message and audio file before doing anything else
-    if 'last_message' in context.chat_data:
-        try:
-            context.bot.delete_message(chat_id=query.message.chat_id, message_id=context.chat_data['last_message'])
-            del context.chat_data['last_message']
-        except Exception as e:
-            print(f'Error deleting last message: {e}')
-    if 'last_audio' in context.chat_data:
-        try:
-            context.bot.delete_message(chat_id=query.message.chat_id, message_id=context.chat_data['last_audio'])
-            del context.chat_data['last_audio']
-        except Exception as e:
-            print(f'Error deleting last audio: {e}')
-
-    if query.data == 'learn':
-        learn(query, context)
-    elif query.data == 'review':
-        review(query, context)
-    elif query.data == 'clear':
-        clear(query, context)
-    elif query.data.startswith('remembered_'):
-        cursor.execute("INSERT INTO words VALUES (?, ?, ?, ?, ?, ?)", context.chat_data['word_data'])
-        conn.commit()
-        learn(query, context)
-    elif query.data.startswith('skip_'):
-        learn(query, context)
-    elif query.data.startswith('next_'):
-        review(query, context)
-    elif query.data == 'end_review':
-        context.bot.send_message(chat_id=query.message.chat_id, text="Repetition is over.")
-        context.chat_data['review_index'] = 0
-        start(update, context)
 
 
 def review(update: Update, context: CallbackContext) -> None:
@@ -218,11 +182,18 @@ def review(update: Update, context: CallbackContext) -> None:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        url = f"http://api.voicerss.org/?key={VOICE_KEY}&hl=en-us&v=Linda&src={word[1]}&r=-2"
-        response = requests.request("GET", url)
+        url = f"https://lingua-robot.p.rapidapi.com/language/v1/entries/en/{word[1]}"
+        headers = {
+            "X-RapidAPI-Key": LINGUA_ROBOT_API_KEY,
+            "X-RapidAPI-Host": "lingua-robot.p.rapidapi.com"
+        }
+        response = requests.get(url, headers=headers).json()
+        audio_url = response['entries'][0]['pronunciations'][1]['audio']['url']
 
         valid_filename = "".join(c for c in word[1] if c.isalpha() or c.isspace()).rstrip()
 
+        # Fetch audio file from audio_url and save it locally
+        response = requests.get(audio_url)
         audio_filename = f'{valid_filename}.mp3'
         with open(audio_filename, 'wb') as audio_file:
             audio_file.write(response.content)
@@ -246,15 +217,64 @@ def review(update: Update, context: CallbackContext) -> None:
         context.chat_data['last_message'] = sent_message.message_id
         context.chat_data['last_audio'] = audio_message.message_id
 
-        os.remove(audio_filename)
+        os.remove(audio_filename)  # delete the local audio file after sending it
     else:
         context.bot.send_message(chat_id=chat_id, text="All learned words are repeated.")
         context.chat_data['review_index'] = 0  # Reset the review index when all words have been reviewed
 
 
 def next_word(update: Update, context: CallbackContext) -> None:
-    # query = update.callback_query
     review(update, context)
+
+
+def clear(update: Update, context: CallbackContext) -> None:
+    query = update
+    chat_id = query.message.chat_id
+    cursor.execute("DELETE FROM words WHERE chat_id=?", (chat_id,))
+    cursor.execute("DELETE FROM skipped_words WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    context.bot.send_message(chat_id=chat_id, text="All learned words are deleted.")
+    start(query, context)
+
+
+def button(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    query.answer()
+    # Delete the previous message and audio file before doing anything else
+    if 'last_message' in context.chat_data:
+        try:
+            context.bot.delete_message(chat_id=query.message.chat_id, message_id=context.chat_data['last_message'])
+            del context.chat_data['last_message']
+        except Exception as e:
+            print(f'Error deleting last message: {e}')
+    if 'last_audio' in context.chat_data:
+        try:
+            context.bot.delete_message(chat_id=query.message.chat_id, message_id=context.chat_data['last_audio'])
+            del context.chat_data['last_audio']
+        except Exception as e:
+            print(f'Error deleting last audio: {e}')
+
+    if query.data == 'learn':
+        learn(query, context)
+    elif query.data == 'review':
+        review(query, context)
+    elif query.data == 'clear':
+        clear(query, context)
+    elif query.data.startswith('remembered_'):
+        cursor.execute("INSERT INTO words VALUES (?, ?, ?, ?, ?, ?)", context.chat_data['word_data'])
+        conn.commit()
+        learn(query, context)
+    elif query.data.startswith('skip_'):
+        skipped_word = query.data.split('_')[1]
+        cursor.execute("INSERT INTO skipped_words VALUES (?, ?)", (query.message.chat_id, skipped_word))
+        conn.commit()
+        learn(query, context)
+    elif query.data.startswith('next_'):
+        review(query, context)
+    elif query.data == 'end_review':
+        context.bot.send_message(chat_id=query.message.chat_id, text="Repetition is over.")
+        context.chat_data['review_index'] = 0
+        start(update, context)
 
 
 def main() -> None:
